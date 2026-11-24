@@ -19,7 +19,7 @@ from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, ChallengeRequired, ClientError
 
 # ============ CONFIG ============
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.getenv("9118049489:AAHORiDWM_YAsQZuOeRD_CniM3LQXMPXrg0")
 
 # Railway Volume support: /app/data agar volume attached hai
 DATA_DIR = "/app/data" if os.path.exists("/app/data") else "."
