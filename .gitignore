@@ -1,1 +1,7 @@
-
+accounts.json
+sessions/
+*.session.json
+downloads/
+covers/
+__pycache__/
+.env
