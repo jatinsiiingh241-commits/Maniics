@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Bot for Multi-Account Instagram Reel Uploader
-Railway-ready with persistent volume support
+Telegram Bot for Multi-Account Instagram Reel Uploader (Cookie + Password Fallback)
 """
 import os
 import json
@@ -19,6 +18,7 @@ from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, ChallengeRequired, ClientError
 
 # ============ CONFIG ============
+# Apna naya Bot Token yahan daalo
 BOT_TOKEN = "9118049489:AAHORiDWM_YAsQZuOeRD_CniM3LQXMPXrg0"
 
 DATA_DIR = "/app/data" if os.path.exists("/app/data") else "."
@@ -31,15 +31,12 @@ for d in [SESSIONS_DIR, DOWNLOADS_DIR, COVERS_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # ============ LOGGING ============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ============ CONVERSATION STATES ============
 (
-    SELECT_MODE, ASK_USERNAME, ASK_PASSWORD, ASK_TOTP_SEED,
+    SELECT_MODE, ASK_USERNAME, ASK_PASSWORD, ASK_COOKIE,
     RECEIVE_VIDEO, RECEIVE_COVER, RECEIVE_CAPTION, CONFIRM_UPLOAD
 ) = range(8)
 
@@ -61,53 +58,58 @@ def get_session_path(username):
     return os.path.join(SESSIONS_DIR, f"{username}.json")
 
 def login_account(account):
-    """Login with session or fresh login using TOTP seed"""
+    """Hybrid Login: Cookie first, then Session File, then Password."""
     client = Client()
     client.delay_range = [1, 3]
     client.request_timeout = 30
     
     session_file = get_session_path(account['username'])
     
+    # 1. Try Cookie (SessionID)
+    if account.get('sessionid'):
+        try:
+            logger.info(f"Trying Cookie login for {account['username']}")
+            client.login_by_sessionid(account['sessionid'])
+            client.dump_settings(session_file)  # Save for future
+            return client, "cookie"
+        except Exception as e:
+            logger.warning(f"Cookie login failed for {account['username']}: {e}")
+    
+    # 2. Try Saved Session File
     if os.path.exists(session_file):
         try:
             client.load_settings(session_file)
-            client.get_timeline_feed()
-            logger.info(f"Session valid: {account['username']}")
-            return client, "session"
+            client.get_timeline_feed()  # Validate
+            return client, "session_file"
         except Exception:
-            logger.warning(f"Session expired: {account['username']}")
+            logger.warning(f"Session file expired for {account['username']}")
             os.remove(session_file)
     
-    verification_code = None
-    if account.get('totp_seed'):
-        try:
-            verification_code = client.totp_generate_code(account['totp_seed'])
-            logger.info(f"Generated TOTP code for {account['username']}")
-        except Exception as e:
-            logger.error(f"TOTP generation failed: {e}")
+    # 3. Fallback to Password
+    if account.get('password'):
+        verification_code = None
+        if account.get('totp_seed'):
+            try:
+                verification_code = client.totp_generate_code(account['totp_seed'])
+            except Exception:
+                pass
+        
+        client.login(account['username'], account['password'], verification_code=verification_code)
+        client.dump_settings(session_file)
+        return client, "password"
     
-    client.login(
-        account['username'],
-        account['password'],
-        verification_code=verification_code
-    )
-    client.dump_settings(session_file)
-    logger.info(f"Fresh login successful: {account['username']}")
-    return client, "fresh"
+    raise Exception("Koi valid login method nahi mila (Cookie ya Password).")
 
 # ============ TELEGRAM HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Purane data clear karo taaki conflict na ho
     context.user_data.clear()
-    
     keyboard = [
         [InlineKeyboardButton("➕ Add New Account", callback_data="add_account")],
         [InlineKeyboardButton("📤 Upload Reel", callback_data="upload_reel")],
         [InlineKeyboardButton("📊 Account Status", callback_data="status")],
     ]
     await update.message.reply_text(
-        "🤖 **Instagram Reel Uploader Bot**\n\n"
-        "Kya karna hai?",
+        "🤖 **Instagram Reel Uploader Bot**\n\nKya karna hai?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -119,10 +121,7 @@ async def mode_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = query.data
     
     if action == "add_account":
-        await query.edit_message_text(
-            "📝 **Naya Account Add Karo**\n\n"
-            "Username bhejo (bina @ ke):"
-        )
+        await query.edit_message_text("📝 **Naya Account Add Karo**\n\nUsername bhejo (bina @ ke):")
         return ASK_USERNAME
     
     elif action == "upload_reel":
@@ -132,10 +131,7 @@ async def mode_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         
         context.user_data['accounts'] = accounts
-        await query.edit_message_text(
-            f"✅ {len(accounts)} account(s) loaded.\n\n"
-            "Ab **video** bhejo (MP4, 10MB tak):"
-        )
+        await query.edit_message_text(f"✅ {len(accounts)} account(s) loaded.\n\nAb **video** bhejo (MP4, 10MB tak):")
         return RECEIVE_VIDEO
     
     elif action == "status":
@@ -150,10 +146,7 @@ async def mode_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = "✅ Logged In" if os.path.exists(session_file) else "❌ Not Logged In"
             lines.append(f"• `{acc['username']}`: {status}")
         
-        await query.edit_message_text(
-            "📊 **Account Status**\n\n" + "\n".join(lines),
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("📊 **Account Status**\n\n" + "\n".join(lines), parse_mode="Markdown")
         return ConversationHandler.END
     
     return SELECT_MODE
@@ -161,39 +154,35 @@ async def mode_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ ADD ACCOUNT FLOW ============
 async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['new_username'] = update.message.text.strip().replace('@', '')
-    await update.message.reply_text("🔑 Ab **password** bhejo:")
+    await update.message.reply_text("🔑 Ab **password** bhejo (Agar sirf cookie use karna hai to `none` likho):")
     return ASK_PASSWORD
 
 async def ask_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Password ko save karo, delete MAT karo taaki error na aaye
-    context.user_data['new_password'] = update.message.text.strip()
+    text = update.message.text.strip()
+    context.user_data['new_password'] = None if text.lower() == 'none' else text
     
     await update.message.reply_text(
-        "🔐 Ab **2FA Seed** bhejo:\n\n"
-        "(Agar 2FA nahi hai to `none` likho)"
+        "🍪 Ab **Instagram SessionID (Cookie)** bhejo:\n\n"
+        "(Agar password use kar rahe ho to `none` likho)"
     )
-    return ASK_TOTP_SEED
+    return ASK_COOKIE
 
-async def ask_totp_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    seed_text = update.message.text.strip()
-    
-    # SEED FIX: Agar user ne spaces daale hain to unhe hata do
-    if seed_text.lower() == 'none':
-        seed = None
-    else:
-        seed = seed_text.replace(" ", "")  # Spaces remove karo
+async def ask_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    sessionid = None if text.lower() == 'none' else text
     
     username = context.user_data.get('new_username')
     password = context.user_data.get('new_password')
     
-    if not username or not password:
+    if not username or (not password and not sessionid):
         await update.message.reply_text("❌ Data missing. /start karke dobara try karo.")
         return ConversationHandler.END
     
     account = {
         "username": username,
         "password": password,
-        "totp_seed": seed,
+        "sessionid": sessionid,
+        "totp_seed": None, 
         "enabled": True
     }
     
@@ -208,19 +197,8 @@ async def ask_totp_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_accounts(accounts)
         
         await update.message.reply_text(
-            f"✅ **Login Successful!**\n\n"
-            f"Account: `{username}`\n"
-            f"Method: {method}\n"
-            f"Session saved.\n\n"
-            f"Ab video upload kar sakte ho.",
+            f"✅ **Login Successful!**\n\nAccount: `{username}`\nMethod: {method}\nSession saved.",
             parse_mode="Markdown"
-        )
-    except ChallengeRequired as e:
-        await update.message.reply_text(
-            f"❌ **Challenge Required**\n\n"
-            f"Instagram ne verification maanga hai.\n"
-            f"Pehle browser/app se manually login karo, phir retry karo.\n\n"
-            f"Error: {str(e)[:200]}"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ **Login Failed**\n\n`{str(e)[:300]}`", parse_mode="Markdown")
@@ -235,10 +213,7 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return RECEIVE_VIDEO
     
     if video.file_size > 10 * 1024 * 1024:
-        await update.message.reply_text(
-            f"❌ Video 10MB se badi hai ({video.file_size / 1024 / 1024:.1f}MB).\n"
-            f"Chhoti video bhejo."
-        )
+        await update.message.reply_text(f"❌ Video 10MB se badi hai.")
         return RECEIVE_VIDEO
     
     file = await video.get_file()
@@ -276,9 +251,7 @@ async def receive_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")],
     ]
     await update.message.reply_text(
-        f"📋 **Confirm Upload**\n\n"
-        f"Caption: {caption[:100]}{'...' if len(caption) > 100 else ''}\n\n"
-        f"Upload karna hai?",
+        f"📋 **Confirm Upload**\n\nCaption: {caption[:100]}...\n\nUpload karna hai?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -289,11 +262,9 @@ async def confirm_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == "cancel_upload":
-        video_path = context.user_data.get('video_path')
-        cover_path = context.user_data.get('cover_path')
-        for p in [video_path, cover_path]:
-            if p and os.path.exists(p):
-                os.remove(p)
+        for key in ['video_path', 'cover_path']:
+            p = context.user_data.get(key)
+            if p and os.path.exists(p): os.remove(p)
         await query.edit_message_text("❌ Upload cancelled.")
         return ConversationHandler.END
     
@@ -318,32 +289,45 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, account in enumerate(accounts):
         username = account['username']
         try:
-            await update.message.reply_text(
-                f"🔄 [{i+1}/{total}] `{username}` pe upload ho raha hai...",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"🔄 [{i+1}/{total}] `{username}` pe upload ho raha hai...", parse_mode="Markdown")
             
             client, method = login_account(account)
-            media = client.clip_upload(
-                Path(video_path),
-                caption,
-                thumbnail=Path(cover_path) if cover_path and os.path.exists(cover_path) else None
-            )
+            
+            # SMART FALLBACK: Agar cookie se fail ho, to password fallback karega
+            try:
+                media = client.clip_upload(
+                    Path(video_path),
+                    caption,
+                    thumbnail=Path(cover_path) if cover_path and os.path.exists(cover_path) else None
+                )
+            except Exception as upload_err:
+                if "login_required" in str(upload_err).lower() and account.get('password'):
+                    logger.warning("Cookie se upload fail, password fallback try kar rahe hain...")
+                    client = Client()
+                    v_code = client.totp_generate_code(account['totp_seed']) if account.get('totp_seed') else None
+                    client.login(account['username'], account['password'], verification_code=v_code)
+                    client.dump_settings(get_session_path(username))
+                    
+                    media = client.clip_upload(
+                        Path(video_path),
+                        caption,
+                        thumbnail=Path(cover_path) if cover_path and os.path.exists(cover_path) else None
+                    )
+                else:
+                    raise upload_err
             
             results.append(f"✅ `{username}`: Uploaded (ID: {media.pk})")
             success_count += 1
             logger.info(f"Uploaded to {username}: {media.pk}")
             
-            if i < total - 1:
-                await asyncio.sleep(5)
+            if i < total - 1: await asyncio.sleep(5)
                 
         except Exception as e:
             results.append(f"❌ `{username}`: Failed - {str(e)[:100]}")
             logger.error(f"Upload failed for {username}: {e}")
     
     for p in [video_path, cover_path]:
-        if p and os.path.exists(p):
-            os.remove(p)
+        if p and os.path.exists(p): os.remove(p)
     
     report = (
         f"📊 **Upload Complete**\n\n"
@@ -355,8 +339,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in ['video_path', 'cover_path']:
         p = context.user_data.get(key)
-        if p and os.path.exists(p):
-            os.remove(p)
+        if p and os.path.exists(p): os.remove(p)
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
@@ -374,7 +357,7 @@ def main():
             SELECT_MODE: [CallbackQueryHandler(mode_selected)],
             ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_username)],
             ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_password)],
-            ASK_TOTP_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_totp_seed)],
+            ASK_COOKIE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_cookie)],
             RECEIVE_VIDEO: [MessageHandler(filters.VIDEO, receive_video)],
             RECEIVE_COVER: [MessageHandler(filters.PHOTO, receive_cover)],
             RECEIVE_CAPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_caption)],
@@ -385,7 +368,6 @@ def main():
     )
     
     app.add_handler(conv_handler)
-    
     logger.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
 
