@@ -19,17 +19,14 @@ from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, ChallengeRequired, ClientError
 
 # ============ CONFIG ============
-# Yahan apna naya token daal do (jo tumne BotFather se liya hai)
 BOT_TOKEN = "9118049489:AAHORiDWM_YAsQZuOeRD_CniM3LQXMPXrg0"
 
-# Railway Volume support: /app/data agar volume attached hai
 DATA_DIR = "/app/data" if os.path.exists("/app/data") else "."
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
 DOWNLOADS_DIR = os.path.join(DATA_DIR, "downloads")
 COVERS_DIR = os.path.join(DATA_DIR, "covers")
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 
-# Create directories
 for d in [SESSIONS_DIR, DOWNLOADS_DIR, COVERS_DIR]:
     os.makedirs(d, exist_ok=True)
 
@@ -71,7 +68,6 @@ def login_account(account):
     
     session_file = get_session_path(account['username'])
     
-    # Try session first (bina password)
     if os.path.exists(session_file):
         try:
             client.load_settings(session_file)
@@ -82,7 +78,6 @@ def login_account(account):
             logger.warning(f"Session expired: {account['username']}")
             os.remove(session_file)
     
-    # Fresh login with TOTP
     verification_code = None
     if account.get('totp_seed'):
         try:
@@ -102,6 +97,9 @@ def login_account(account):
 
 # ============ TELEGRAM HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Purane data clear karo taaki conflict na ho
+    context.user_data.clear()
+    
     keyboard = [
         [InlineKeyboardButton("➕ Add New Account", callback_data="add_account")],
         [InlineKeyboardButton("📤 Upload Reel", callback_data="upload_reel")],
@@ -167,12 +165,9 @@ async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_PASSWORD
 
 async def ask_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Password ko save karo, delete MAT karo taaki error na aaye
     context.user_data['new_password'] = update.message.text.strip()
-    # Delete password message for security
-    try:
-        await update.message.delete()
-    except:
-        pass
+    
     await update.message.reply_text(
         "🔐 Ab **2FA Seed** bhejo:\n\n"
         "(Agar 2FA nahi hai to `none` likho)"
@@ -181,10 +176,19 @@ async def ask_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_totp_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seed_text = update.message.text.strip()
-    seed = None if seed_text.lower() == 'none' else seed_text
     
-    username = context.user_data['new_username']
-    password = context.user_data['new_password']
+    # SEED FIX: Agar user ne spaces daale hain to unhe hata do
+    if seed_text.lower() == 'none':
+        seed = None
+    else:
+        seed = seed_text.replace(" ", "")  # Spaces remove karo
+    
+    username = context.user_data.get('new_username')
+    password = context.user_data.get('new_password')
+    
+    if not username or not password:
+        await update.message.reply_text("❌ Data missing. /start karke dobara try karo.")
+        return ConversationHandler.END
     
     account = {
         "username": username,
@@ -198,7 +202,6 @@ async def ask_totp_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         client, method = login_account(account)
         
-        # Save account
         accounts = load_accounts()
         accounts = [a for a in accounts if a['username'] != username]
         accounts.append(account)
@@ -231,7 +234,6 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Video bhejo (MP4 format).")
         return RECEIVE_VIDEO
     
-    # 10MB check
     if video.file_size > 10 * 1024 * 1024:
         await update.message.reply_text(
             f"❌ Video 10MB se badi hai ({video.file_size / 1024 / 1024:.1f}MB).\n"
@@ -287,7 +289,6 @@ async def confirm_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == "cancel_upload":
-        # Cleanup
         video_path = context.user_data.get('video_path')
         cover_path = context.user_data.get('cover_path')
         for p in [video_path, cover_path]:
@@ -296,7 +297,6 @@ async def confirm_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Upload cancelled.")
         return ConversationHandler.END
     
-    # Start upload
     await query.edit_message_text("🔄 Upload shuru ho raha hai...")
     await start_upload(update, context)
     return ConversationHandler.END
@@ -334,7 +334,6 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success_count += 1
             logger.info(f"Uploaded to {username}: {media.pk}")
             
-            # Small delay between accounts
             if i < total - 1:
                 await asyncio.sleep(5)
                 
@@ -342,12 +341,10 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f"❌ `{username}`: Failed - {str(e)[:100]}")
             logger.error(f"Upload failed for {username}: {e}")
     
-    # Cleanup
     for p in [video_path, cover_path]:
         if p and os.path.exists(p):
             os.remove(p)
     
-    # Final report
     report = (
         f"📊 **Upload Complete**\n\n"
         f"Total: {total} | ✅ Success: {success_count} | ❌ Failed: {total - success_count}\n\n"
@@ -356,7 +353,6 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report, parse_mode="Markdown")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Cleanup files
     for key in ['video_path', 'cover_path']:
         p = context.user_data.get(key)
         if p and os.path.exists(p):
